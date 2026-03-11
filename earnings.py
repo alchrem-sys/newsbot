@@ -18,11 +18,15 @@ Sources:
 
 import hashlib
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import finnhub
 import yfinance as yf
+
+# Finnhub free tier: 30 calls/minute → 1 call per 2 seconds to stay safe
+_FINNHUB_DELAY = 2.0
 
 from config import FINNHUB_API_KEY, EARNINGS_LOOKBACK_DAYS, PRE_EARNINGS_ALERT_DAYS
 from storage import is_seen, mark_seen
@@ -80,6 +84,7 @@ class EarningsReport:
 # ─── Fetchers ─────────────────────────────────────────────────────────────────
 
 def _get_calendar(ticker: str, days_ahead: int = 14) -> list[dict]:
+    time.sleep(_FINNHUB_DELAY)
     try:
         today = datetime.now(timezone.utc)
         data = _fh.earnings_calendar(
@@ -95,6 +100,7 @@ def _get_calendar(ticker: str, days_ahead: int = 14) -> list[dict]:
 
 
 def _get_surprises(ticker: str) -> list[dict]:
+    time.sleep(_FINNHUB_DELAY)
     try:
         return _fh.company_earnings(ticker, limit=4) or []
     except Exception as e:
