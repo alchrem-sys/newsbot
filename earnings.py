@@ -8,6 +8,7 @@ stays free for bot commands during every API wait.
 
 import asyncio
 import hashlib
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -153,16 +154,33 @@ async def _fh_surprises(ticker: str) -> list[dict]:
 
 
 async def _yf_currency(ticker: str) -> str:
+    cache_key = f"currency:{ticker}"
+    cached = get_cache(cache_key)
+    if cached:
+        return cached
+
     def _call():
         try:
             info = yf.Ticker(ticker).info
             return info.get("financialCurrency") or info.get("currency") or "USD"
         except Exception:
             return "USD"
-    return await asyncio.to_thread(_call)
+
+    result = await asyncio.to_thread(_call)
+    # Currency almost never changes — cache for 24 hours
+    set_cache(cache_key, result, ttl_seconds=86400)
+    return result
 
 
 async def _yf_financials(ticker: str) -> dict:
+    cache_key = f"financials:{ticker}"
+    cached = get_cache(cache_key)
+    if cached:
+        try:
+            return json.loads(cached)
+        except Exception:
+            pass
+
     def _call():
         try:
             stock = yf.Ticker(ticker)
@@ -188,7 +206,12 @@ async def _yf_financials(ticker: str) -> dict:
         except Exception as e:
             logger.warning(f"yfinance financials [{ticker}]: {e}")
             return {}
-    return await asyncio.to_thread(_call)
+
+    result = await asyncio.to_thread(_call)
+    if result:
+        # Financials change quarterly — cache for 12 hours
+        set_cache(cache_key, json.dumps(result), ttl_seconds=43200)
+    return result
 
 
 async def _yf_earnings_dates(ticker: str) -> list[str]:
@@ -222,7 +245,18 @@ async def _yf_exact_time_for_date(ticker: str, date_str: str) -> Optional[dateti
     """
     Return the exact tz-aware UTC time from yfinance for a specific date.
     Returns None if yfinance has no time data for that date.
+    Cached in Upstash for 4 hours to avoid hammering Yahoo.
     """
+    cache_key = f"exact_time:{ticker}:{date_str}"
+    cached = get_cache(cache_key)
+    if cached:
+        try:
+            return datetime.fromisoformat(cached) if cached != "null" else None
+        except Exception:
+            pass
+
+    await asyncio.sleep(0.5)  # gentle throttle between yfinance calls
+
     def _call():
         try:
             ed = yf.Ticker(ticker).earnings_dates
@@ -238,7 +272,10 @@ async def _yf_exact_time_for_date(ticker: str, date_str: str) -> Optional[dateti
         except Exception:
             pass
         return None
-    return await asyncio.to_thread(_call)
+
+    result = await asyncio.to_thread(_call)
+    set_cache(cache_key, result.isoformat() if result else "null", ttl_seconds=14400)
+    return result
 
 
 async def _get_earnings_info(ticker: str) -> Optional[dict]:
@@ -453,7 +490,6 @@ async def get_full_earnings_calendar(days_ahead: int = 14) -> list[dict]:
     Cache is written by pre_earnings_job() every 30 min so data is always fresh.
     Falls back to a live fetch only if the cache is empty (e.g. first boot).
     """
-    import json
 
     # ── Try cache first ───────────────────────────────────────────────────────
     cached = get_cache(CALENDAR_CACHE_KEY)
@@ -482,7 +518,6 @@ async def get_full_earnings_calendar(days_ahead: int = 14) -> list[dict]:
 
 async def _fetch_calendar_live(days_ahead: int = 14) -> list[dict]:
     """Live fetch from Finnhub. Called by the background job and on cache miss."""
-    import json
 
     today = datetime.now(timezone.utc).date()
     results = []
