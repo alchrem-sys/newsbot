@@ -31,8 +31,8 @@ from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, CHECK_INTERVAL_MINUTES
-from earnings import check_upcoming_earnings_alerts, check_new_earnings, get_full_earnings_calendar
-from formatters import format_pre_earnings, format_earnings, format_news, format_upcoming_calendar, pack_messages
+from earnings import check_upcoming_earnings_alerts, check_new_earnings, check_intraday_reminders, get_full_earnings_calendar
+from formatters import format_pre_earnings, format_earnings, format_intraday_reminder, format_news, format_upcoming_calendar, pack_messages
 from mexc_price import get_mexc_price, format_mexc_price
 from news import check_new_news
 from storage import get_setting, set_setting, health_check
@@ -49,6 +49,44 @@ dp = Dispatcher()
 
 _last: dict = {"pre": None, "earnings": None, "news": None}
 CATEGORIES = ("pre", "earnings", "news")
+
+
+# ─── Pinned calendar ──────────────────────────────────────────────────────────
+
+async def _pin_upcoming_calendar() -> None:
+    """
+    Send the upcoming earnings calendar, pin it, unpin the previous one.
+    Pinned message ID is saved in Upstash so it survives bot restarts.
+    """
+    try:
+        data = get_full_earnings_calendar(days_ahead=14)
+        text = format_upcoming_calendar(data)
+        text += f"\n\n<i>📌 Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</i>"
+
+        # Unpin old pinned message if we saved its ID
+        old_id = get_setting("pinned_calendar_msg_id")
+        if old_id:
+            try:
+                await bot.unpin_chat_message(TELEGRAM_CHAT_ID, int(old_id))
+            except Exception:
+                pass  # Already gone — fine
+
+        # Send new message and pin it (silent — no notification)
+        msg = await bot.send_message(TELEGRAM_CHAT_ID, text)
+        await bot.pin_chat_message(TELEGRAM_CHAT_ID, msg.message_id, disable_notification=True)
+
+        # Persist new message ID so next run can unpin it
+        set_setting("pinned_calendar_msg_id", str(msg.message_id))
+        logger.info(f"Pinned calendar updated (msg_id={msg.message_id})")
+
+    except Exception as e:
+        logger.error(f"_pin_upcoming_calendar: {e}", exc_info=True)
+
+
+async def pin_calendar_job() -> None:
+    """Runs daily at 07:00 UTC — refreshes the pinned earnings calendar."""
+    logger.info("Running daily pinned calendar refresh...")
+    await _pin_upcoming_calendar()
 
 
 # ─── Mute helpers ─────────────────────────────────────────────────────────────
@@ -114,6 +152,23 @@ async def news_job() -> None:
         logger.error(f"news_job: {e}", exc_info=True)
 
 
+async def intraday_job() -> None:
+    """Runs every 5 minutes. Fires 2h/1h/30m/5m/1min reminders on earnings day."""
+    if _muted("pre"):
+        return
+    try:
+        reminders = check_intraday_reminders()
+        if reminders:
+            for batch in pack_messages([format_intraday_reminder(r) for r in reminders]):
+                await bot.send_message(
+                    TELEGRAM_CHAT_ID,
+                    f"⏱ <b>{len(reminders)} intraday reminder(s)</b>\n\n" + batch
+                )
+            logger.info(f"Sent {len(reminders)} intraday reminders.")
+    except Exception as e:
+        logger.error(f"intraday_job: {e}", exc_info=True)
+
+
 # ─── Commands ─────────────────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
@@ -149,6 +204,12 @@ async def cmd_upcoming(message: Message) -> None:
     await message.answer("🔍 Fetching earnings calendar…")
     data = get_full_earnings_calendar(days_ahead=14)
     await message.answer(format_upcoming_calendar(data))
+
+
+@dp.message(Command("pinupcoming"))
+async def cmd_pinupcoming(message: Message) -> None:
+    await message.answer("📌 Pinning earnings calendar…")
+    await _pin_upcoming_calendar()
 
 
 @dp.message(Command("price"))
@@ -270,6 +331,13 @@ async def main() -> None:
                       start_date=now + timedelta(minutes=3))
     scheduler.add_job(news_job,         "interval", minutes=CHECK_INTERVAL_MINUTES,
                       start_date=now + timedelta(minutes=6))
+
+    # Intraday reminders run every 5 minutes — tight loop for 1min/5min alerts
+    scheduler.add_job(intraday_job, "interval", minutes=5, id="intraday",
+                      start_date=now + timedelta(minutes=1))
+
+    # Daily at 07:00 UTC — refresh and re-pin the upcoming earnings calendar
+    scheduler.add_job(pin_calendar_job, "cron", hour=7, minute=0, id="pin_calendar")
 
     scheduler.start()
     logger.info(f"Scheduler started — every {CHECK_INTERVAL_MINUTES} min")
