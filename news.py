@@ -1,251 +1,317 @@
 """
-news.py — Financial news fetcher, fully async.
+main.py — MEXC Earnings & News Telegram Bot
+Railway + Upstash | Fully async — bot commands always respond instantly.
 
-Key fix: all Finnhub/yfinance calls run via asyncio.to_thread() so the
-event loop (and bot commands) are never blocked by API sleeps.
+Root cause of lag fix:
+  All Finnhub/yfinance calls now run via asyncio.to_thread() in earnings.py
+  and news.py. Rate-limit sleeps use asyncio.sleep() not time.sleep().
+  The event loop is never blocked — /help responds in <1s even mid-sweep.
 
-Rate limiting is done with asyncio.sleep() not time.sleep(), which
-yields control back to the event loop during the wait.
+Scheduler:
+  news_job          → every 1 min  (5-min lookback, async)
+  intraday_job      → every 5 min  (day-of countdown: 2h/1h/30m/5m/1m)
+  pre_earnings_job  → every 30 min (7d/3d/1d/day-of milestones)
+  earnings_job      → every 30 min (post-announcement results)
+
+Commands:
+  /start /help /upcoming /price /tickers /status
+  /mute [pre|earnings|news]  /unmute [pre|earnings|news]  /settings
 """
 
 import asyncio
-import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
 
-import feedparser
-import finnhub
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from config import FINNHUB_API_KEY
-from storage import is_seen, mark_seen
-from tickers import ALL_TICKERS
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, CHECK_INTERVAL_MINUTES
+from earnings import (
+    check_upcoming_earnings_alerts,
+    check_new_earnings,
+    check_intraday_reminders,
+    get_full_earnings_calendar,
+    _fetch_calendar_live,
+)
+from formatters import (
+    format_pre_earnings, format_earnings, format_intraday_reminder,
+    format_news, format_upcoming_calendar, pack_messages,
+)
+from mexc_price import get_mexc_price, format_mexc_price
+from news import check_new_news
+from storage import get_setting, set_setting, health_check
+from tickers import MEXC_TO_TICKER, ALL_TICKERS
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+# yfinance logs "No earnings dates found" / "may be delisted" as ERROR for
+# perfectly valid tickers when Yahoo simply has no data — pure noise.
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logger = logging.getLogger(__name__)
-_fh = finnhub.Client(api_key=FINNHUB_API_KEY)
 
-# Finnhub free tier: 30 calls/min → 2s between calls
-# Using asyncio.sleep so the event loop is NOT blocked during the wait
-_FINNHUB_DELAY = 2.0
+bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp  = Dispatcher()
 
-MIN_IMPORTANCE_SCORE = 60
-MAX_PER_TICKER = 2
-
-# ── Scoring tables ────────────────────────────────────────────────────────────
-
-_CATEGORY_RULES: list[tuple[int, list[str]]] = [
-    (50, ["earnings beat", "earnings miss", "beat estimates", "missed estimates",
-          "beat expectations", "missed expectations", "eps beat", "eps miss",
-          "revenue beat", "revenue miss", "raised guidance", "lowered guidance",
-          "cut guidance", "raised outlook", "profit warning", "earnings surprise",
-          "quarterly results", "q1 results", "q2 results", "q3 results", "q4 results",
-          "full year results", "annual results"]),
-    (45, ["price target", "upgrades to", "downgrades to", "initiates coverage",
-          "raised target", "lowered target", "overweight", "underweight",
-          "outperform", "underperform", "buy rating", "sell rating",
-          "strong buy", "strong sell", "neutral rating", "hold rating",
-          "analyst upgrade", "analyst downgrade", "price target raised",
-          "price target cut"]),
-    (45, ["merger", "acquisition", "acquires", "acquired by", "takeover",
-          "buyout", "going private", "deal worth", "billion deal",
-          "agreed to buy", "agreed to acquire", "to be acquired",
-          "strategic acquisition", "tender offer"]),
-    (40, ["ceo resigns", "ceo steps down", "new ceo", "appoints ceo",
-          "cfo resigns", "cfo steps down", "new cfo", "appoints cfo",
-          "chief executive", "executive departure", "leadership change"]),
-    (40, ["fda approval", "fda approved", "fda rejected", "sec charges",
-          "sec investigation", "doj investigation", "ftc blocks", "antitrust",
-          "regulatory approval", "sanctioned", "banned", "delisted"]),
-    (35, ["stock split", "share buyback", "buyback program", "special dividend",
-          "dividend increase", "dividend cut", "dividend suspended",
-          "share repurchase"]),
-    (30, ["major partnership", "exclusive deal", "major contract",
-          "billion contract", "government contract", "new product launch",
-          "product recall", "plant closure", "major layoffs", "mass layoffs"]),
-    (25, ["lawsuit filed", "class action", "settles lawsuit", "fined",
-          "settlement reached", "court ruling", "subpoena", "indicted"]),
-    (20, ["restructuring", "cost cutting", "job cuts", "workforce reduction",
-          "lays off", "laying off"]),
-]
-
-_PHRASE_SCORES: dict[str, int] = {}
-_CATEGORY_LABELS: dict[int, str] = {
-    50: "Earnings", 45: "Analyst / M&A", 40: "Executive / Regulatory",
-    35: "Capital Action", 30: "Major News", 25: "Legal", 20: "Restructuring",
-}
-for _bonus, _phrases in _CATEGORY_RULES:
-    for _phrase in _phrases:
-        _PHRASE_SCORES[_phrase] = _bonus
-
-_POSITIVE_WORDS = {"beat","beats","surpass","record","profit","rise","rises","gain",
-                   "gains","upgrade","growth","strong","bullish","rally","outperform",
-                   "raises","exceeds","soars","jumps","surges"}
-_NEGATIVE_WORDS = {"miss","misses","missed","decline","declines","loss","losses",
-                   "downgrade","weak","bearish","fall","falls","cut","cuts","layoff",
-                   "warning","disappoints","plunges","drops","tumbles"}
-
-_NOISE_PENALTIES: dict[str, int] = {}
-for _penalty, _phrases in [
-    (-30, ["stocks to watch","top stocks","best stocks","stocks to buy",
-           "5 stocks","3 stocks","10 stocks","stocks that could"]),
-    (-20, ["here's why","why i think","opinion:","should you buy","is it a buy"]),
-    (-10, ["premarket movers","after hours movers","market recap",
-           "morning briefing","midday movers"]),
-    (-10, ["sponsored","paid content","advertisement"]),
-]:
-    for _phrase in _phrases:
-        _NOISE_PENALTIES[_phrase] = _penalty
+_last: dict = {"pre": None, "earnings": None, "news": None}
+CATEGORIES = ("pre", "earnings", "news")
 
 
-# ── Data class ────────────────────────────────────────────────────────────────
+# ─── Mute helpers ─────────────────────────────────────────────────────────────
 
-class NewsItem:
-    def __init__(self, ticker: str, headline: str, summary: str,
-                 url: str, source: str, published_at: str):
-        self.ticker = ticker
-        self.headline = headline
-        self.summary = summary
-        self.url = url
-        self.source = source
-        self.published_at = published_at
-        self.sentiment = "neutral"
-        self.importance = 0
-        self.category = ""
+def _muted(cat: str) -> bool:
+    return get_setting(f"mute_{cat}") == "1"
 
-    @property
-    def uid(self) -> str:
-        raw = self.url if self.url else self.headline
-        return hashlib.md5(raw.encode()).hexdigest()
+def _set_mute(cat: str, on: bool) -> None:
+    set_setting(f"mute_{cat}", "1" if on else "0")
 
 
-# ── Scorer ────────────────────────────────────────────────────────────────────
+# ─── Scheduler jobs ───────────────────────────────────────────────────────────
 
-def _score(headline: str, summary: str) -> tuple[int, str, str]:
-    text = (headline + " " + summary).lower()
-    score, top_bonus, top_cat = 0, 0, ""
-
-    for phrase, bonus in sorted(_PHRASE_SCORES.items(), key=lambda x: -len(x[0])):
-        if phrase in text:
-            score += bonus
-            if bonus > top_bonus:
-                top_bonus = bonus
-                top_cat = _CATEGORY_LABELS.get(bonus, "News")
-
-    words = set(text.split())
-    pos = len(words & _POSITIVE_WORDS)
-    neg = len(words & _NEGATIVE_WORDS)
-    score += 10 if max(pos, neg) >= 2 else (5 if max(pos, neg) == 1 else 0)
-
-    sentiment = "positive" if pos > neg else ("negative" if neg > pos else "neutral")
-
-    for phrase, penalty in _NOISE_PENALTIES.items():
-        if phrase in text:
-            score += penalty
-
-    return min(max(score, 0), 100), sentiment, top_cat or "News"
-
-
-# ── Async fetchers ────────────────────────────────────────────────────────────
-
-async def _fetch_finnhub(ticker: str, from_ts: int, to_ts: int) -> list[NewsItem]:
-    """Runs Finnhub call in a thread — never blocks the event loop."""
-    await asyncio.sleep(_FINNHUB_DELAY)  # async sleep — yields to event loop
-
-    def _sync_call():
-        return _fh.company_news(
-            ticker,
-            _from=datetime.fromtimestamp(from_ts, tz=timezone.utc).strftime("%Y-%m-%d"),
-            to=datetime.fromtimestamp(to_ts, tz=timezone.utc).strftime("%Y-%m-%d"),
-        )
-
-    items = []
+async def news_job() -> None:
+    """Every 1 min. Fully async — never blocks commands."""
+    if _muted("news"):
+        return
     try:
-        articles = await asyncio.to_thread(_sync_call)
-        for art in (articles or []):
-            pub = datetime.fromtimestamp(art.get("datetime", 0), tz=timezone.utc)
-            items.append(NewsItem(
-                ticker=ticker,
-                headline=art.get("headline", ""),
-                summary=art.get("summary", "")[:300],
-                url=art.get("url", ""),
-                source=art.get("source", "Finnhub"),
-                published_at=pub.strftime("%Y-%m-%d %H:%M UTC"),
-            ))
+        items = await check_new_news()
+        for item in items:
+            try:
+                await bot.send_message(TELEGRAM_CHAT_ID, format_news(item))
+                await asyncio.sleep(0.4)
+            except Exception as e:
+                logger.warning(f"Send news [{item.ticker}]: {e}")
+        _last["news"] = datetime.now(timezone.utc)
     except Exception as e:
-        logger.warning(f"Finnhub news [{ticker}]: {e}")
-    return items
+        logger.error(f"news_job: {e}", exc_info=True)
 
 
-async def _fetch_yahoo_rss(ticker: str, cutoff: datetime) -> list[NewsItem]:
-    """Runs feedparser in a thread — never blocks the event loop."""
-    def _sync_call():
-        url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote(ticker)}&region=US&lang=en-US"
-        return feedparser.parse(url)
-
-    items = []
+async def intraday_job() -> None:
+    """Every 5 min. Fires 2h/1h/30m/5m/1m reminders on earnings day."""
+    if _muted("pre"):
+        return
     try:
-        feed = await asyncio.to_thread(_sync_call)
-        for entry in feed.entries:
-            ps = entry.get("published_parsed")
-            if ps:
-                pub_dt = datetime(*ps[:6], tzinfo=timezone.utc)
-                if pub_dt < cutoff:
-                    continue
-                pub_str = pub_dt.strftime("%Y-%m-%d %H:%M UTC")
-            else:
-                pub_str = "Unknown"
-            items.append(NewsItem(
-                ticker=ticker,
-                headline=entry.get("title", ""),
-                summary=entry.get("summary", "")[:300],
-                url=entry.get("link", ""),
-                source="Yahoo Finance",
-                published_at=pub_str,
-            ))
+        reminders = await check_intraday_reminders()
+        for r in reminders:
+            try:
+                await bot.send_message(TELEGRAM_CHAT_ID, format_intraday_reminder(r))
+                await asyncio.sleep(0.4)
+            except Exception as e:
+                logger.warning(f"Send intraday [{r.ticker}]: {e}")
     except Exception as e:
-        logger.warning(f"Yahoo RSS [{ticker}]: {e}")
-    return items
+        logger.error(f"intraday_job: {e}", exc_info=True)
 
 
-# ── Main check ────────────────────────────────────────────────────────────────
+async def pre_earnings_job() -> None:
+    """Every 30 min. Fires day-level milestone alerts + refreshes /upcoming cache."""
+    if _muted("pre"):
+        return
+    try:
+        alerts = await check_upcoming_earnings_alerts()
+        alerts.sort(key=lambda a: a.milestone)
+        for a in alerts:
+            try:
+                await bot.send_message(TELEGRAM_CHAT_ID, format_pre_earnings(a))
+                await asyncio.sleep(0.4)
+            except Exception as e:
+                logger.warning(f"Send pre-earnings [{a.ticker}]: {e}")
+        _last["pre"] = datetime.now(timezone.utc)
 
-async def check_new_news() -> list[NewsItem]:
-    """
-    Async — runs every 1 minute with a 5-minute lookback.
-    All blocking calls are offloaded to threads via asyncio.to_thread().
-    The event loop stays free for bot commands throughout the entire sweep.
-    """
-    cutoff  = datetime.now(timezone.utc) - timedelta(minutes=5)
-    from_ts = int(cutoff.timestamp())
-    to_ts   = int(datetime.now(timezone.utc).timestamp())
-    results: list[NewsItem] = []
+        # Refresh the calendar cache so /upcoming responds instantly
+        await _fetch_calendar_live(days_ahead=14)
+        logger.info("Calendar cache refreshed")
+    except Exception as e:
+        logger.error(f"pre_earnings_job: {e}", exc_info=True)
 
-    for ticker in ALL_TICKERS:
-        articles = await _fetch_finnhub(ticker, from_ts, to_ts)
-        if not articles:
-            articles = await _fetch_yahoo_rss(ticker, cutoff)
 
-        scored: list[NewsItem] = []
-        for item in articles:
-            if is_seen("news", item.uid):
-                continue
-            s, sentiment, category = _score(item.headline, item.summary)
-            item.importance = s
-            item.sentiment  = sentiment
-            item.category   = category
-            if s >= MIN_IMPORTANCE_SCORE:
-                scored.append(item)
+async def earnings_job() -> None:
+    """Every 30 min. Sends post-announcement results."""
+    if _muted("earnings"):
+        return
+    try:
+        reports = await check_new_earnings()
+        for r in reports:
+            try:
+                await bot.send_message(TELEGRAM_CHAT_ID, format_earnings(r))
+                await asyncio.sleep(0.4)
+            except Exception as e:
+                logger.warning(f"Send earnings [{r.ticker}]: {e}")
+        _last["earnings"] = datetime.now(timezone.utc)
+    except Exception as e:
+        logger.error(f"earnings_job: {e}", exc_info=True)
 
-        scored.sort(key=lambda x: -x.importance)
-        for item in scored[:MAX_PER_TICKER]:
-            mark_seen("news", item.uid)
-            results.append(item)
-            logger.info(f"News [{item.importance}pts] {ticker}: {item.headline[:60]}")
 
-        # Mark low-score articles seen so they don't accumulate
-        for item in articles:
-            if not is_seen("news", item.uid):
-                mark_seen("news", item.uid)
+# ─── Commands ─────────────────────────────────────────────────────────────────
 
-    results.sort(key=lambda x: -x.importance)
-    return results
+@dp.message(CommandStart())
+async def cmd_start(message: Message) -> None:
+    await message.answer(
+        "👋 <b>MEXC Earnings & News Bot</b>\n\n"
+        f"Monitoring <b>{len(ALL_TICKERS)}</b> stocks.\n"
+        f"News: every 1 min  |  Earnings: every {CHECK_INTERVAL_MINUTES} min\n\n"
+        "⭐ Pre-earnings: 7d / 3d / 1d / day-of + intraday (2h/1h/30m/5m/1m)\n\n"
+        "/help — all commands"
+    )
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    await message.answer(
+        "📋 <b>Commands</b>\n\n"
+        "/upcoming          — earnings calendar (14 days)\n"
+        "/price <i>SYMBOL</i>    — live MEXC price  e.g. /price NVDAUSDT\n"
+        "/tickers           — full watchlist\n"
+        "/status            — bot health\n"
+        "/settings          — mute state\n"
+        "/mute pre          — pause countdown alerts\n"
+        "/mute earnings     — pause results alerts\n"
+        "/mute news         — pause news alerts\n"
+        "/unmute <i>category</i>  — resume"
+    )
+
+
+@dp.message(Command("upcoming"))
+async def cmd_upcoming(message: Message) -> None:
+    from storage import get_cache
+    # Only show "Fetching..." on a cold cache (first boot before any background job)
+    if not get_cache("earnings_calendar_14d"):
+        await message.answer("🔍 Fetching… (first load, will be instant next time)")
+    data = await get_full_earnings_calendar(days_ahead=14)
+    await message.answer(format_upcoming_calendar(data))
+
+
+@dp.message(Command("price"))
+async def cmd_price(message: Message) -> None:
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Usage: /price <b>SYMBOL</b>\nExample: /price NVDAUSDT")
+        return
+    symbol = parts[1].upper().strip()
+    if symbol not in MEXC_TO_TICKER:
+        await message.answer(f"❌ <code>{symbol}</code> not in watchlist. Use /tickers.")
+        return
+    data = await get_mexc_price(symbol)
+    if not data:
+        await message.answer(f"⚠️ Could not fetch price for <code>{symbol}</code>.")
+        return
+    await message.answer(format_mexc_price(symbol, data))
+
+
+@dp.message(Command("tickers"))
+async def cmd_tickers(message: Message) -> None:
+    lines = ["📋 <b>MEXC Watchlist</b>\n"]
+    for mexc, real in sorted(MEXC_TO_TICKER.items()):
+        lines.append(f"<code>{mexc:<20}</code> → <b>{real}</b>")
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("mute"))
+async def cmd_mute(message: Message) -> None:
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2 or parts[1].lower() not in CATEGORIES:
+        await message.answer(f"Usage: /mute [{'|'.join(CATEGORIES)}]")
+        return
+    cat = parts[1].lower()
+    _set_mute(cat, True)
+    await message.answer(f"🔇 <b>{cat}</b> alerts muted.")
+
+
+@dp.message(Command("unmute"))
+async def cmd_unmute(message: Message) -> None:
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2 or parts[1].lower() not in CATEGORIES:
+        await message.answer(f"Usage: /unmute [{'|'.join(CATEGORIES)}]")
+        return
+    cat = parts[1].lower()
+    _set_mute(cat, False)
+    await message.answer(f"🔔 <b>{cat}</b> alerts resumed.")
+
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: Message) -> None:
+    lines = ["⚙️ <b>Settings</b>\n"]
+    for cat in CATEGORIES:
+        icon = "🔇 MUTED" if _muted(cat) else "🔔 active"
+        lines.append(f"  {cat:<12} {icon}")
+    lines += ["", f"Check interval: news=1min  earnings={CHECK_INTERVAL_MINUTES}min"]
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message) -> None:
+    def fmt(dt) -> str:
+        return dt.strftime("%Y-%m-%d %H:%M UTC") if dt else "Not yet run"
+    redis_ok = health_check()
+    await message.answer(
+        "🤖 <b>Bot Status</b>\n\n"
+        f"✅ Railway\n"
+        f"{'✅' if redis_ok else '❌'} Upstash Redis\n\n"
+        f"⭐ Pre-earnings:  {fmt(_last['pre'])}\n"
+        f"📊 Results:       {fmt(_last['earnings'])}\n"
+        f"📰 News:          {fmt(_last['news'])}\n\n"
+        f"👀 {len(ALL_TICKERS)} tickers"
+    )
+
+
+# ─── Startup / shutdown ───────────────────────────────────────────────────────
+
+async def on_startup() -> None:
+    redis_ok = health_check()
+    logger.info(f"Startup | Redis: {'ok' if redis_ok else 'FAILED'}")
+    await pre_earnings_job()
+    await earnings_job()
+    await news_job()
+    await bot.send_message(
+        TELEGRAM_CHAT_ID,
+        "🚀 <b>MEXC Bot online!</b>\n"
+        f"Railway ✅  Upstash {'✅' if redis_ok else '❌'}\n"
+        f"{len(ALL_TICKERS)} tickers  |  news=5min  earnings=4h\n"
+        "/help for commands"
+    )
+
+
+async def on_shutdown() -> None:
+    try:
+        await bot.send_message(TELEGRAM_CHAT_ID, "🛑 Bot shutting down.")
+    except Exception:
+        pass
+
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
+async def main() -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN not set")
+    if not TELEGRAM_CHAT_ID:
+        raise ValueError("TELEGRAM_CHAT_ID not set")
+
+    now = datetime.now(timezone.utc)
+    scheduler = AsyncIOScheduler(timezone="UTC")
+
+    scheduler.add_job(news_job,         "interval", minutes=5,
+                      start_date=now + timedelta(seconds=15))
+    scheduler.add_job(intraday_job,     "interval", minutes=5,
+                      start_date=now + timedelta(minutes=1))
+    scheduler.add_job(pre_earnings_job, "interval", hours=4,
+                      start_date=now + timedelta(minutes=2))
+    scheduler.add_job(earnings_job,     "interval", hours=4,
+                      start_date=now + timedelta(minutes=3))
+
+    scheduler.start()
+    logger.info("Scheduler started")
+
+    await on_startup()
+
+    try:
+        await dp.start_polling(bot, skip_updates=True)
+    finally:
+        await on_shutdown()
+        scheduler.shutdown(wait=False)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
