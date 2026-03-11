@@ -1,151 +1,100 @@
 """
-news.py — Financial news fetcher with importance filter.
+news.py — Financial news fetcher, fully async.
 
-The spam problem was: every article for every ticker was sent regardless of value.
-Fix: every article gets an importance SCORE (0–100). Only articles scoring
-above MIN_IMPORTANCE_SCORE are sent. Default threshold is 60.
+Key fix: all Finnhub/yfinance calls run via asyncio.to_thread() so the
+event loop (and bot commands) are never blocked by API sleeps.
 
-Scoring system (additive, capped at 100):
-  Category bonuses (the biggest drivers):
-    +50  Earnings beat/miss/guidance
-    +45  Analyst upgrade/downgrade with price target
-    +45  M&A / merger / acquisition / takeover
-    +40  CEO/CFO/executive change
-    +40  Regulatory approval / FDA / SEC action
-    +35  Stock split / buyback / special dividend
-    +30  Major product launch / partnership
-    +25  Legal action / lawsuit / DOJ / FTC
-    +20  Layoffs / restructuring
-    +15  Macroeconomic data directly mentioning the company
-
-  Sentiment modifier:
-    +10  Strong positive or negative sentiment (score >= 2 keywords)
-    +5   Mild sentiment (score == 1 keyword)
-
-  Noise penalties (subtractive):
-    -30  Article is a listicle / "X stocks to watch" / "best stocks"
-    -20  Opinion / commentary / "why I think" / "here's why"
-    -15  Duplicate story (headline highly similar to already-sent one)
-    -10  Sponsored / promoted content signals
-    -10  Pre-market/after-hours recap (generic, not company-specific)
-
-Threshold: MIN_IMPORTANCE_SCORE = 60 (configurable in config.py)
-Maximum 2 articles per ticker per run to prevent one company flooding the chat.
+Rate limiting is done with asyncio.sleep() not time.sleep(), which
+yields control back to the event loop during the wait.
 """
 
+import asyncio
 import hashlib
 import logging
-import re
-import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import feedparser
 import finnhub
 
-_FINNHUB_DELAY = 2.0
-
-from config import FINNHUB_API_KEY, NEWS_LOOKBACK_HOURS
+from config import FINNHUB_API_KEY
 from storage import is_seen, mark_seen
 from tickers import ALL_TICKERS
 
 logger = logging.getLogger(__name__)
 _fh = finnhub.Client(api_key=FINNHUB_API_KEY)
 
-# ── Tunable constants ──────────────────────────────────────────────────────────
-MIN_IMPORTANCE_SCORE = 60   # Articles below this are dropped
-MAX_PER_TICKER       = 2    # Max articles per ticker per run
+# Finnhub free tier: 30 calls/min → 2s between calls
+# Using asyncio.sleep so the event loop is NOT blocked during the wait
+_FINNHUB_DELAY = 2.0
 
+MIN_IMPORTANCE_SCORE = 60
+MAX_PER_TICKER = 2
 
-# ── Scoring keyword tables ─────────────────────────────────────────────────────
+# ── Scoring tables ────────────────────────────────────────────────────────────
 
-# (score_bonus, [keywords]) — matched against lowercased headline + summary
 _CATEGORY_RULES: list[tuple[int, list[str]]] = [
-    # Earnings / financial results
     (50, ["earnings beat", "earnings miss", "beat estimates", "missed estimates",
           "beat expectations", "missed expectations", "eps beat", "eps miss",
           "revenue beat", "revenue miss", "raised guidance", "lowered guidance",
           "cut guidance", "raised outlook", "profit warning", "earnings surprise",
           "quarterly results", "q1 results", "q2 results", "q3 results", "q4 results",
           "full year results", "annual results"]),
-
-    # Analyst actions
     (45, ["price target", "upgrades to", "downgrades to", "initiates coverage",
           "raised target", "lowered target", "overweight", "underweight",
           "outperform", "underperform", "buy rating", "sell rating",
           "strong buy", "strong sell", "neutral rating", "hold rating",
           "analyst upgrade", "analyst downgrade", "price target raised",
           "price target cut"]),
-
-    # M&A
     (45, ["merger", "acquisition", "acquires", "acquired by", "takeover",
           "buyout", "going private", "deal worth", "billion deal",
           "agreed to buy", "agreed to acquire", "to be acquired",
           "strategic acquisition", "tender offer"]),
-
-    # Executive changes
     (40, ["ceo resigns", "ceo steps down", "new ceo", "appoints ceo",
           "cfo resigns", "cfo steps down", "new cfo", "appoints cfo",
-          "chief executive", "executive departure", "board chair",
-          "founder steps down", "leadership change"]),
-
-    # Regulatory / legal major
-    (40, ["fda approval", "fda approved", "fda rejected", "fda rejection",
-          "sec charges", "sec investigation", "doj investigation",
-          "ftc blocks", "antitrust", "regulatory approval", "cleared by",
-          "sanctioned", "banned", "delisted"]),
-
-    # Capital actions
+          "chief executive", "executive departure", "leadership change"]),
+    (40, ["fda approval", "fda approved", "fda rejected", "sec charges",
+          "sec investigation", "doj investigation", "ftc blocks", "antitrust",
+          "regulatory approval", "sanctioned", "banned", "delisted"]),
     (35, ["stock split", "share buyback", "buyback program", "special dividend",
           "dividend increase", "dividend cut", "dividend suspended",
-          "share repurchase", "tender offer", "dutch auction"]),
-
-    # Major business news
-    (30, ["major partnership", "exclusive deal", "landmark deal",
-          "major contract", "billion contract", "government contract",
-          "new product launch", "product recall", "plant closure",
-          "factory shutdown", "major layoffs", "mass layoffs"]),
-
-    # Legal / regulatory moderate
+          "share repurchase"]),
+    (30, ["major partnership", "exclusive deal", "major contract",
+          "billion contract", "government contract", "new product launch",
+          "product recall", "plant closure", "major layoffs", "mass layoffs"]),
     (25, ["lawsuit filed", "class action", "settles lawsuit", "fined",
-          "settlement reached", "court ruling", "subpoena", "indicted",
-          "charged with", "faces probe"]),
-
-    # Restructuring
+          "settlement reached", "court ruling", "subpoena", "indicted"]),
     (20, ["restructuring", "cost cutting", "job cuts", "workforce reduction",
-          "lays off", "laying off", "streamlining operations"]),
+          "lays off", "laying off"]),
 ]
 
-# Flatten for fast lookup: phrase → bonus
 _PHRASE_SCORES: dict[str, int] = {}
+_CATEGORY_LABELS: dict[int, str] = {
+    50: "Earnings", 45: "Analyst / M&A", 40: "Executive / Regulatory",
+    35: "Capital Action", 30: "Major News", 25: "Legal", 20: "Restructuring",
+}
 for _bonus, _phrases in _CATEGORY_RULES:
     for _phrase in _phrases:
         _PHRASE_SCORES[_phrase] = _bonus
 
-# Sentiment keywords (secondary, smaller boost)
-_POSITIVE_WORDS = {"beat", "beats", "surpass", "record", "profit", "rise", "rises",
-                   "gain", "gains", "upgrade", "growth", "strong", "bullish", "rally",
-                   "outperform", "raises", "exceeds", "soars", "jumps", "surges"}
-_NEGATIVE_WORDS = {"miss", "misses", "missed", "decline", "declines", "loss", "losses",
-                   "downgrade", "weak", "bearish", "fall", "falls", "cut", "cuts",
-                   "layoff", "warning", "disappoints", "plunges", "drops", "tumbles"}
+_POSITIVE_WORDS = {"beat","beats","surpass","record","profit","rise","rises","gain",
+                   "gains","upgrade","growth","strong","bullish","rally","outperform",
+                   "raises","exceeds","soars","jumps","surges"}
+_NEGATIVE_WORDS = {"miss","misses","missed","decline","declines","loss","losses",
+                   "downgrade","weak","bearish","fall","falls","cut","cuts","layoff",
+                   "warning","disappoints","plunges","drops","tumbles"}
 
-# Noise penalty phrases
-_NOISE_PENALTIES: list[tuple[int, list[str]]] = [
-    (-30, ["stocks to watch", "top stocks", "best stocks", "stocks to buy",
-           "stocks making moves", "5 stocks", "3 stocks", "10 stocks",
-           "stocks that could", "stocks you should"]),
-    (-20, ["here's why", "why i think", "opinion:", "commentary:", "should you buy",
-           "is it a buy", "is it time to", "what you need to know"]),
-    (-10, ["premarket movers", "after hours movers", "market recap",
-           "morning briefing", "midday movers", "stocks on the move today"]),
-    (-10, ["sponsored", "paid content", "advertisement", "partner content"]),
-]
-
-_NOISE_PHRASE_SCORES: dict[str, int] = {}
-for _penalty, _phrases in _NOISE_PENALTIES:
+_NOISE_PENALTIES: dict[str, int] = {}
+for _penalty, _phrases in [
+    (-30, ["stocks to watch","top stocks","best stocks","stocks to buy",
+           "5 stocks","3 stocks","10 stocks","stocks that could"]),
+    (-20, ["here's why","why i think","opinion:","should you buy","is it a buy"]),
+    (-10, ["premarket movers","after hours movers","market recap",
+           "morning briefing","midday movers"]),
+    (-10, ["sponsored","paid content","advertisement"]),
+]:
     for _phrase in _phrases:
-        _NOISE_PHRASE_SCORES[_phrase] = _penalty
+        _NOISE_PENALTIES[_phrase] = _penalty
 
 
 # ── Data class ────────────────────────────────────────────────────────────────
@@ -160,8 +109,8 @@ class NewsItem:
         self.source = source
         self.published_at = published_at
         self.sentiment = "neutral"
-        self.importance = 0    # 0–100
-        self.category = ""     # human-readable label e.g. "Earnings Beat"
+        self.importance = 0
+        self.category = ""
 
     @property
     def uid(self) -> str:
@@ -169,70 +118,49 @@ class NewsItem:
         return hashlib.md5(raw.encode()).hexdigest()
 
 
-# ── Importance scorer ─────────────────────────────────────────────────────────
+# ── Scorer ────────────────────────────────────────────────────────────────────
 
-# Category labels for display (highest-scoring category wins)
-_CATEGORY_LABELS = {
-    50: "Earnings",
-    45: "Analyst Action",  # used for both upgrade/downgrade and M&A
-    40: "Executive Change",
-    35: "Capital Action",
-    30: "Major News",
-    25: "Legal",
-    20: "Restructuring",
-}
-
-def _score_article(headline: str, summary: str) -> tuple[int, str, str]:
-    """
-    Returns (score, sentiment, category_label).
-    Score is capped at 100.
-    """
+def _score(headline: str, summary: str) -> tuple[int, str, str]:
     text = (headline + " " + summary).lower()
-    score = 0
-    top_bonus = 0
-    top_category = ""
+    score, top_bonus, top_cat = 0, 0, ""
 
-    # Category bonuses — check multi-word phrases first
     for phrase, bonus in sorted(_PHRASE_SCORES.items(), key=lambda x: -len(x[0])):
         if phrase in text:
             score += bonus
             if bonus > top_bonus:
                 top_bonus = bonus
-                top_category = _CATEGORY_LABELS.get(bonus, "News")
+                top_cat = _CATEGORY_LABELS.get(bonus, "News")
 
-    # Sentiment modifier
     words = set(text.split())
     pos = len(words & _POSITIVE_WORDS)
     neg = len(words & _NEGATIVE_WORDS)
-    sentiment_score = max(pos, neg)
-    if sentiment_score >= 2:
-        score += 10
-    elif sentiment_score == 1:
-        score += 5
+    score += 10 if max(pos, neg) >= 2 else (5 if max(pos, neg) == 1 else 0)
 
-    sentiment = "neutral"
-    if pos > neg:   sentiment = "positive"
-    elif neg > pos: sentiment = "negative"
+    sentiment = "positive" if pos > neg else ("negative" if neg > pos else "neutral")
 
-    # Noise penalties
-    for phrase, penalty in _NOISE_PHRASE_SCORES.items():
+    for phrase, penalty in _NOISE_PENALTIES.items():
         if phrase in text:
-            score += penalty  # penalty is already negative
+            score += penalty
 
-    return min(max(score, 0), 100), sentiment, top_category or "News"
+    return min(max(score, 0), 100), sentiment, top_cat or "News"
 
 
-# ── Fetchers ──────────────────────────────────────────────────────────────────
+# ── Async fetchers ────────────────────────────────────────────────────────────
 
-def _finnhub_news(ticker: str, from_ts: int, to_ts: int) -> list[NewsItem]:
-    time.sleep(_FINNHUB_DELAY)
-    items = []
-    try:
-        articles = _fh.company_news(
+async def _fetch_finnhub(ticker: str, from_ts: int, to_ts: int) -> list[NewsItem]:
+    """Runs Finnhub call in a thread — never blocks the event loop."""
+    await asyncio.sleep(_FINNHUB_DELAY)  # async sleep — yields to event loop
+
+    def _sync_call():
+        return _fh.company_news(
             ticker,
             _from=datetime.fromtimestamp(from_ts, tz=timezone.utc).strftime("%Y-%m-%d"),
             to=datetime.fromtimestamp(to_ts, tz=timezone.utc).strftime("%Y-%m-%d"),
         )
+
+    items = []
+    try:
+        articles = await asyncio.to_thread(_sync_call)
         for art in (articles or []):
             pub = datetime.fromtimestamp(art.get("datetime", 0), tz=timezone.utc)
             items.append(NewsItem(
@@ -248,11 +176,15 @@ def _finnhub_news(ticker: str, from_ts: int, to_ts: int) -> list[NewsItem]:
     return items
 
 
-def _yahoo_rss_news(ticker: str, cutoff: datetime) -> list[NewsItem]:
+async def _fetch_yahoo_rss(ticker: str, cutoff: datetime) -> list[NewsItem]:
+    """Runs feedparser in a thread — never blocks the event loop."""
+    def _sync_call():
+        url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote(ticker)}&region=US&lang=en-US"
+        return feedparser.parse(url)
+
     items = []
     try:
-        url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={quote(ticker)}&region=US&lang=en-US"
-        feed = feedparser.parse(url)
+        feed = await asyncio.to_thread(_sync_call)
         for entry in feed.entries:
             ps = entry.get("published_parsed")
             if ps:
@@ -277,53 +209,43 @@ def _yahoo_rss_news(ticker: str, cutoff: datetime) -> list[NewsItem]:
 
 # ── Main check ────────────────────────────────────────────────────────────────
 
-def check_new_news() -> list[NewsItem]:
+async def check_new_news() -> list[NewsItem]:
     """
-    Fetch news for all tickers, score each article, and return only
-    the important ones (score >= MIN_IMPORTANCE_SCORE).
-    Lookback is 5 minutes — tight window for 1-minute polling.
-    Upstash dedup ensures nothing is ever sent twice.
-    Max MAX_PER_TICKER articles per ticker per run.
+    Async — runs every 1 minute with a 5-minute lookback.
+    All blocking calls are offloaded to threads via asyncio.to_thread().
+    The event loop stays free for bot commands throughout the entire sweep.
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+    cutoff  = datetime.now(timezone.utc) - timedelta(minutes=5)
     from_ts = int(cutoff.timestamp())
     to_ts   = int(datetime.now(timezone.utc).timestamp())
     results: list[NewsItem] = []
 
     for ticker in ALL_TICKERS:
-        articles = _finnhub_news(ticker, from_ts, to_ts)
+        articles = await _fetch_finnhub(ticker, from_ts, to_ts)
         if not articles:
-            articles = _yahoo_rss_news(ticker, cutoff)
+            articles = await _fetch_yahoo_rss(ticker, cutoff)
 
         scored: list[NewsItem] = []
         for item in articles:
             if is_seen("news", item.uid):
                 continue
-
-            score, sentiment, category = _score_article(item.headline, item.summary)
-            item.importance = score
+            s, sentiment, category = _score(item.headline, item.summary)
+            item.importance = s
             item.sentiment  = sentiment
             item.category   = category
-
-            if score >= MIN_IMPORTANCE_SCORE:
+            if s >= MIN_IMPORTANCE_SCORE:
                 scored.append(item)
 
-        # Sort by importance, keep only top MAX_PER_TICKER per ticker
         scored.sort(key=lambda x: -x.importance)
         for item in scored[:MAX_PER_TICKER]:
             mark_seen("news", item.uid)
             results.append(item)
-            logger.info(
-                f"News [{score}pts/{item.category}] {ticker}: "
-                f"{item.headline[:60]}"
-            )
+            logger.info(f"News [{item.importance}pts] {ticker}: {item.headline[:60]}")
 
-        # Mark everything else as seen too so low-score articles
-        # don't pile up and re-score next run
+        # Mark low-score articles seen so they don't accumulate
         for item in articles:
             if not is_seen("news", item.uid):
                 mark_seen("news", item.uid)
 
-    # Sort final list: highest importance first
     results.sort(key=lambda x: -x.importance)
     return results
