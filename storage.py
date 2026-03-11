@@ -58,6 +58,24 @@ def set_setting(key: str, value: str) -> None:
         logger.warning(f"Redis set_setting error: {e}")
 
 
+def set_cache(key: str, value: str, ttl_seconds: int = 3600) -> None:
+    """Store a JSON blob with a TTL. Used for caching heavy API results."""
+    try:
+        _r().set(f"mexcbot:cache:{key}", value, ex=ttl_seconds)
+    except Exception as e:
+        logger.warning(f"Redis set_cache error [{key}]: {e}")
+
+
+def get_cache(key: str) -> Optional[str]:
+    """Retrieve a cached JSON blob. Returns None if missing or expired."""
+    try:
+        val = _r().get(f"mexcbot:cache:{key}")
+        return str(val) if val is not None else None
+    except Exception as e:
+        logger.warning(f"Redis get_cache error [{key}]: {e}")
+        return None
+
+
 def health_check() -> bool:
     try:
         _r().ping()
