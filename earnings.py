@@ -54,8 +54,34 @@ def _derive_time(date_str: str, code: str) -> Optional[datetime]:
 
 # ─── Async Finnhub wrappers ───────────────────────────────────────────────────
 
-async def _fh_calendar(ticker: str, days_ahead: int = 90) -> list[dict]:
+# ─── Async Finnhub wrappers ───────────────────────────────────────────────────
+
+async def _fh_fetch(ticker: str, fetch_fn) -> any:
+    """
+    Single choke point for ALL Finnhub calls.
+    2s sleep between calls — free tier allows 30 calls/min.
+    Returns None on 429 so callers fall back to cached data.
+    """
     await asyncio.sleep(_FINNHUB_DELAY)
+    try:
+        return await asyncio.to_thread(fetch_fn)
+    except Exception as e:
+        if "429" in str(e):
+            logger.warning(f"Finnhub 429 [{ticker}] — using cached data")
+        else:
+            logger.warning(f"Finnhub [{ticker}]: {e}")
+        return None
+
+
+async def _fh_calendar(ticker: str, days_ahead: int = 90) -> list[dict]:
+    cache_key = f"fh_cal:{ticker}"
+    cached = get_cache(cache_key)
+    if cached:
+        try:
+            return json.loads(cached)
+        except Exception:
+            pass
+
     def _call():
         today = datetime.now(timezone.utc)
         data = _fh.earnings_calendar(
@@ -64,22 +90,28 @@ async def _fh_calendar(ticker: str, days_ahead: int = 90) -> list[dict]:
             symbol=ticker, international=False,
         )
         return data.get("earningsCalendar", []) if data else []
-    try:
-        return await asyncio.to_thread(_call)
-    except Exception as e:
-        logger.warning(f"Finnhub calendar [{ticker}]: {e}")
-        return []
+
+    result = await _fh_fetch(ticker, _call)
+    entries = result if isinstance(result, list) else []
+    if entries:  # only cache non-empty — empty may mean 429, not truly no data
+        set_cache(cache_key, json.dumps(entries), ttl_seconds=14400)  # 4h
+    return entries
 
 
 async def _fh_surprises(ticker: str) -> list[dict]:
-    await asyncio.sleep(_FINNHUB_DELAY)
-    def _call():
-        return _fh.company_earnings(ticker, limit=4) or []
-    try:
-        return await asyncio.to_thread(_call)
-    except Exception as e:
-        logger.warning(f"Finnhub surprises [{ticker}]: {e}")
-        return []
+    cache_key = f"fh_surp:{ticker}"
+    cached = get_cache(cache_key)
+    if cached:
+        try:
+            return json.loads(cached)
+        except Exception:
+            pass
+
+    result = await _fh_fetch(ticker, lambda: _fh.company_earnings(ticker, limit=4) or [])
+    entries = result if isinstance(result, list) else []
+    if entries:
+        set_cache(cache_key, json.dumps(entries), ttl_seconds=14400)  # 4h
+    return entries
 
 
 async def _yf_fetch(ticker: str, fetch_fn) -> any:
@@ -407,7 +439,7 @@ async def check_new_earnings() -> list[EarningsReport]:
 # ─── Full calendar (/upcoming command) ───────────────────────────────────────
 
 CALENDAR_CACHE_KEY = "earnings_calendar_14d"
-CALENDAR_CACHE_TTL = 60 * 35  # 35 min — slightly longer than the 30-min job interval
+CALENDAR_CACHE_TTL = 60 * 60 * 5  # 5h — longer than the 4h job interval, merge handles freshness
 
 
 async def get_full_earnings_calendar(days_ahead: int = 14) -> list[dict]:
@@ -445,12 +477,28 @@ async def get_full_earnings_calendar(days_ahead: int = 14) -> list[dict]:
 
 
 async def _fetch_calendar_live(days_ahead: int = 14) -> list[dict]:
-    """Live fetch from Finnhub. Called by the background job and on cache miss."""
-
+    """
+    Live fetch from Finnhub. Merges new results with the previous cache snapshot
+    so that tickers which got 429'd keep their last known data instead of
+    disappearing from the calendar — preventing the "info is changing" problem.
+    """
     today = datetime.now(timezone.utc).date()
-    results = []
+
+    # Load previous snapshot keyed by ticker so we can fall back to it
+    prev_by_ticker: dict[str, dict] = {}
+    cached = get_cache(CALENDAR_CACHE_KEY)
+    if cached:
+        try:
+            for item in json.loads(cached):
+                prev_by_ticker[item["ticker"]] = item
+        except Exception:
+            pass
+
+    # Fetch each ticker — collect which ones actually returned data
+    fresh_by_ticker: dict[str, dict] = {}
     for ticker in EQUITY_TICKERS:
-        for entry in await _fh_calendar(ticker, days_ahead=days_ahead):
+        entries = await _fh_calendar(ticker, days_ahead=days_ahead)
+        for entry in entries:
             raw_date = entry.get("date", "")
             d = _parse_date(raw_date)
             if not d:
@@ -458,7 +506,7 @@ async def _fetch_calendar_live(days_ahead: int = 14) -> list[dict]:
             days_until = (d - today).days
             if 0 <= days_until <= days_ahead:
                 exact_time = _derive_time(raw_date, entry.get("hour", ""))
-                results.append({
+                fresh_by_ticker[ticker] = {
                     "ticker":           ticker,
                     "date":             raw_date,
                     "days_until":       days_until,
@@ -468,14 +516,37 @@ async def _fetch_calendar_live(days_ahead: int = 14) -> list[dict]:
                     "exact_time":       exact_time,
                     "exact_time_iso":   exact_time.isoformat() if exact_time else None,
                     "mexc_symbols":     TICKER_TO_MEXC.get(ticker, []),
-                })
+                }
 
-    results = sorted(results, key=lambda x: x["date"])
+    # Merge: fresh data wins; fall back to previous for any ticker that got 429'd
+    merged: dict[str, dict] = {}
+    for ticker in EQUITY_TICKERS:
+        if ticker in fresh_by_ticker:
+            merged[ticker] = fresh_by_ticker[ticker]
+        elif ticker in prev_by_ticker:
+            # Keep previous entry but recompute days_until so it stays accurate
+            item = dict(prev_by_ticker[ticker])
+            d = _parse_date(item.get("date", ""))
+            if d:
+                item["days_until"] = (d - today).days
+                if 0 <= item["days_until"] <= days_ahead:
+                    merged[ticker] = item
+                    logger.debug(f"Calendar fallback to cached data for {ticker}")
 
-    # Write to cache — background job and first-boot both store here
-    try:
-        set_cache(CALENDAR_CACHE_KEY, json.dumps(results, default=str), ttl_seconds=CALENDAR_CACHE_TTL)
-    except Exception as e:
-        logger.warning(f"Failed to write calendar cache: {e}")
+    results = sorted(merged.values(), key=lambda x: x["date"])
+
+    # Only write to cache if we got a reasonably complete result
+    # (at least 50% of equity tickers responded — protects against mass 429)
+    coverage = len(fresh_by_ticker) / max(len(EQUITY_TICKERS), 1)
+    if coverage >= 0.5:
+        try:
+            set_cache(CALENDAR_CACHE_KEY, json.dumps(results, default=str),
+                      ttl_seconds=CALENDAR_CACHE_TTL)
+            logger.info(f"Calendar cache updated: {len(fresh_by_ticker)} fresh, "
+                        f"{len(merged) - len(fresh_by_ticker)} from prev cache")
+        except Exception as e:
+            logger.warning(f"Failed to write calendar cache: {e}")
+    else:
+        logger.warning(f"Calendar coverage only {coverage:.0%} — keeping previous cache")
 
     return results
