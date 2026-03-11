@@ -1,22 +1,21 @@
 """
 main.py — MEXC Earnings & News Telegram Bot
-Hosted on Railway | State stored in Upstash Redis
+Railway + Upstash | Fully async — bot commands always respond instantly.
 
-Scheduler (every 30 min, staggered):
-  pre_earnings_job   → alerts BEFORE report date so you can position on MEXC
-  earnings_job       → full results after announcement
-  news_job           → breaking news with ticker + MEXC symbol first
+Root cause of lag fix:
+  All Finnhub/yfinance calls now run via asyncio.to_thread() in earnings.py
+  and news.py. Rate-limit sleeps use asyncio.sleep() not time.sleep().
+  The event loop is never blocked — /help responds in <1s even mid-sweep.
+
+Scheduler:
+  news_job          → every 1 min  (5-min lookback, async)
+  intraday_job      → every 5 min  (day-of countdown: 2h/1h/30m/5m/1m)
+  pre_earnings_job  → every 30 min (7d/3d/1d/day-of milestones)
+  earnings_job      → every 30 min (post-announcement results)
 
 Commands:
-  /start             welcome
-  /help              command list
-  /upcoming          earnings calendar, next 14 days
-  /price AAPLUSDT    live MEXC futures price
-  /tickers           full watchlist
-  /status            bot health + last check times
-  /mute [pre|earnings|news]    pause a category
-  /unmute [pre|earnings|news]  resume
-  /settings          view current mute state
+  /start /help /upcoming /price /tickers /status
+  /mute [pre|earnings|news]  /unmute [pre|earnings|news]  /settings
 """
 
 import asyncio
@@ -31,8 +30,16 @@ from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, CHECK_INTERVAL_MINUTES
-from earnings import check_upcoming_earnings_alerts, check_new_earnings, check_intraday_reminders, get_full_earnings_calendar
-from formatters import format_pre_earnings, format_earnings, format_intraday_reminder, format_news, format_upcoming_calendar, pack_messages
+from earnings import (
+    check_upcoming_earnings_alerts,
+    check_new_earnings,
+    check_intraday_reminders,
+    get_full_earnings_calendar,
+)
+from formatters import (
+    format_pre_earnings, format_earnings, format_intraday_reminder,
+    format_news, format_upcoming_calendar, pack_messages,
+)
 from mexc_price import get_mexc_price, format_mexc_price
 from news import check_new_news
 from storage import get_setting, set_setting, health_check
@@ -45,48 +52,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+dp  = Dispatcher()
 
 _last: dict = {"pre": None, "earnings": None, "news": None}
 CATEGORIES = ("pre", "earnings", "news")
-
-
-# ─── Pinned calendar ──────────────────────────────────────────────────────────
-
-async def _pin_upcoming_calendar() -> None:
-    """
-    Send the upcoming earnings calendar, pin it, unpin the previous one.
-    Pinned message ID is saved in Upstash so it survives bot restarts.
-    """
-    try:
-        data = get_full_earnings_calendar(days_ahead=14)
-        text = format_upcoming_calendar(data)
-        text += f"\n\n<i>📌 Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</i>"
-
-        # Unpin old pinned message if we saved its ID
-        old_id = get_setting("pinned_calendar_msg_id")
-        if old_id:
-            try:
-                await bot.unpin_chat_message(TELEGRAM_CHAT_ID, int(old_id))
-            except Exception:
-                pass  # Already gone — fine
-
-        # Send new message and pin it (silent — no notification)
-        msg = await bot.send_message(TELEGRAM_CHAT_ID, text)
-        await bot.pin_chat_message(TELEGRAM_CHAT_ID, msg.message_id, disable_notification=True)
-
-        # Persist new message ID so next run can unpin it
-        set_setting("pinned_calendar_msg_id", str(msg.message_id))
-        logger.info(f"Pinned calendar updated (msg_id={msg.message_id})")
-
-    except Exception as e:
-        logger.error(f"_pin_upcoming_calendar: {e}", exc_info=True)
-
-
-async def pin_calendar_job() -> None:
-    """Runs daily at 07:00 UTC — refreshes the pinned earnings calendar."""
-    logger.info("Running daily pinned calendar refresh...")
-    await _pin_upcoming_calendar()
 
 
 # ─── Mute helpers ─────────────────────────────────────────────────────────────
@@ -100,73 +69,72 @@ def _set_mute(cat: str, on: bool) -> None:
 
 # ─── Scheduler jobs ───────────────────────────────────────────────────────────
 
-async def pre_earnings_job() -> None:
-    if _muted("pre"):
-        return
-    logger.info("Running pre-earnings check...")
-    try:
-        alerts = check_upcoming_earnings_alerts()
-        if alerts:
-            alerts.sort(key=lambda a: a.milestone)
-            for batch in pack_messages([format_pre_earnings(a) for a in alerts]):
-                await bot.send_message(
-                    TELEGRAM_CHAT_ID,
-                    f"⚡ <b>{len(alerts)} earnings alert(s)</b>\n\n" + batch
-                )
-        _last["pre"] = datetime.now(timezone.utc)
-    except Exception as e:
-        logger.error(f"pre_earnings_job: {e}", exc_info=True)
-
-
-async def earnings_job() -> None:
-    if _muted("earnings"):
-        return
-    logger.info("Running post-earnings check...")
-    try:
-        reports = check_new_earnings()
-        if reports:
-            for batch in pack_messages([format_earnings(r) for r in reports]):
-                await bot.send_message(
-                    TELEGRAM_CHAT_ID,
-                    f"📊 <b>{len(reports)} earnings result(s)</b>\n\n" + batch
-                )
-        _last["earnings"] = datetime.now(timezone.utc)
-    except Exception as e:
-        logger.error(f"earnings_job: {e}", exc_info=True)
-
-
 async def news_job() -> None:
+    """Every 1 min. Fully async — never blocks commands."""
     if _muted("news"):
         return
-    logger.info("Running news check...")
     try:
-        items = check_new_news()
+        items = await check_new_news()
         for item in items:
             try:
                 await bot.send_message(TELEGRAM_CHAT_ID, format_news(item))
-                await asyncio.sleep(0.5)  # small gap so Telegram doesn't rate-limit us
+                await asyncio.sleep(0.4)
             except Exception as e:
-                logger.warning(f"Failed to send news item [{item.ticker}]: {e}")
+                logger.warning(f"Send news [{item.ticker}]: {e}")
         _last["news"] = datetime.now(timezone.utc)
     except Exception as e:
         logger.error(f"news_job: {e}", exc_info=True)
 
 
 async def intraday_job() -> None:
-    """Runs every 5 minutes. Fires 2h/1h/30m/5m/1min reminders on earnings day."""
+    """Every 5 min. Fires 2h/1h/30m/5m/1m reminders on earnings day."""
     if _muted("pre"):
         return
     try:
-        reminders = check_intraday_reminders()
-        if reminders:
-            for batch in pack_messages([format_intraday_reminder(r) for r in reminders]):
-                await bot.send_message(
-                    TELEGRAM_CHAT_ID,
-                    f"⏱ <b>{len(reminders)} intraday reminder(s)</b>\n\n" + batch
-                )
-            logger.info(f"Sent {len(reminders)} intraday reminders.")
+        reminders = await check_intraday_reminders()
+        for r in reminders:
+            try:
+                await bot.send_message(TELEGRAM_CHAT_ID, format_intraday_reminder(r))
+                await asyncio.sleep(0.4)
+            except Exception as e:
+                logger.warning(f"Send intraday [{r.ticker}]: {e}")
     except Exception as e:
         logger.error(f"intraday_job: {e}", exc_info=True)
+
+
+async def pre_earnings_job() -> None:
+    """Every 30 min. Fires day-level milestone alerts."""
+    if _muted("pre"):
+        return
+    try:
+        alerts = await check_upcoming_earnings_alerts()
+        alerts.sort(key=lambda a: a.milestone)
+        for a in alerts:
+            try:
+                await bot.send_message(TELEGRAM_CHAT_ID, format_pre_earnings(a))
+                await asyncio.sleep(0.4)
+            except Exception as e:
+                logger.warning(f"Send pre-earnings [{a.ticker}]: {e}")
+        _last["pre"] = datetime.now(timezone.utc)
+    except Exception as e:
+        logger.error(f"pre_earnings_job: {e}", exc_info=True)
+
+
+async def earnings_job() -> None:
+    """Every 30 min. Sends post-announcement results."""
+    if _muted("earnings"):
+        return
+    try:
+        reports = await check_new_earnings()
+        for r in reports:
+            try:
+                await bot.send_message(TELEGRAM_CHAT_ID, format_earnings(r))
+                await asyncio.sleep(0.4)
+            except Exception as e:
+                logger.warning(f"Send earnings [{r.ticker}]: {e}")
+        _last["earnings"] = datetime.now(timezone.utc)
+    except Exception as e:
+        logger.error(f"earnings_job: {e}", exc_info=True)
 
 
 # ─── Commands ─────────────────────────────────────────────────────────────────
@@ -175,10 +143,9 @@ async def intraday_job() -> None:
 async def cmd_start(message: Message) -> None:
     await message.answer(
         "👋 <b>MEXC Earnings & News Bot</b>\n\n"
-        f"Monitoring <b>{len(ALL_TICKERS)}</b> stocks on MEXC.\n"
-        f"Alerts every <b>{CHECK_INTERVAL_MINUTES} min</b>.\n\n"
-        "⭐ Pre-earnings alerts fire at <b>7d / 3d / 1d / day-of</b> "
-        "so you can position before the announcement.\n\n"
+        f"Monitoring <b>{len(ALL_TICKERS)}</b> stocks.\n"
+        f"News: every 1 min  |  Earnings: every {CHECK_INTERVAL_MINUTES} min\n\n"
+        "⭐ Pre-earnings: 7d / 3d / 1d / day-of + intraday (2h/1h/30m/5m/1m)\n\n"
         "/help — all commands"
     )
 
@@ -201,15 +168,9 @@ async def cmd_help(message: Message) -> None:
 
 @dp.message(Command("upcoming"))
 async def cmd_upcoming(message: Message) -> None:
-    await message.answer("🔍 Fetching earnings calendar…")
-    data = get_full_earnings_calendar(days_ahead=14)
+    await message.answer("🔍 Fetching…")
+    data = await get_full_earnings_calendar(days_ahead=14)
     await message.answer(format_upcoming_calendar(data))
-
-
-@dp.message(Command("pinupcoming"))
-async def cmd_pinupcoming(message: Message) -> None:
-    await message.answer("📌 Pinning earnings calendar…")
-    await _pin_upcoming_calendar()
 
 
 @dp.message(Command("price"))
@@ -261,11 +222,11 @@ async def cmd_unmute(message: Message) -> None:
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: Message) -> None:
-    lines = ["⚙️ <b>Settings (Upstash)</b>\n"]
+    lines = ["⚙️ <b>Settings</b>\n"]
     for cat in CATEGORIES:
         icon = "🔇 MUTED" if _muted(cat) else "🔔 active"
         lines.append(f"  {cat:<12} {icon}")
-    lines += ["", f"Check interval: every {CHECK_INTERVAL_MINUTES} min"]
+    lines += ["", f"Check interval: news=1min  earnings={CHECK_INTERVAL_MINUTES}min"]
     await message.answer("\n".join(lines))
 
 
@@ -276,12 +237,12 @@ async def cmd_status(message: Message) -> None:
     redis_ok = health_check()
     await message.answer(
         "🤖 <b>Bot Status</b>\n\n"
-        f"✅ Running on Railway\n"
-        f"{'✅' if redis_ok else '❌'} Upstash Redis: {'ok' if redis_ok else 'ERROR'}\n\n"
-        f"⭐ Last pre-earnings:  {fmt(_last['pre'])}\n"
-        f"📊 Last results:       {fmt(_last['earnings'])}\n"
-        f"📰 Last news:          {fmt(_last['news'])}\n\n"
-        f"⏱ Interval: {CHECK_INTERVAL_MINUTES} min  |  👀 {len(ALL_TICKERS)} tickers"
+        f"✅ Railway\n"
+        f"{'✅' if redis_ok else '❌'} Upstash Redis\n\n"
+        f"⭐ Pre-earnings:  {fmt(_last['pre'])}\n"
+        f"📊 Results:       {fmt(_last['earnings'])}\n"
+        f"📰 News:          {fmt(_last['news'])}\n\n"
+        f"👀 {len(ALL_TICKERS)} tickers"
     )
 
 
@@ -290,18 +251,14 @@ async def cmd_status(message: Message) -> None:
 async def on_startup() -> None:
     redis_ok = health_check()
     logger.info(f"Startup | Redis: {'ok' if redis_ok else 'FAILED'}")
-
-    # Run all checks immediately so you get alerts right away
     await pre_earnings_job()
     await earnings_job()
     await news_job()
-
     await bot.send_message(
         TELEGRAM_CHAT_ID,
-        "🚀 <b>MEXC Bot is online!</b>\n"
-        f"Railway ✅  |  Upstash {'✅' if redis_ok else '❌'}\n"
-        f"Watching {len(ALL_TICKERS)} tickers | Alerts every {CHECK_INTERVAL_MINUTES} min\n"
-        "⭐ Pre-earnings: 7d / 3d / 1d / day-of\n"
+        "🚀 <b>MEXC Bot online!</b>\n"
+        f"Railway ✅  Upstash {'✅' if redis_ok else '❌'}\n"
+        f"{len(ALL_TICKERS)} tickers  |  news=1min  earnings={CHECK_INTERVAL_MINUTES}min\n"
         "/help for commands"
     )
 
@@ -317,32 +274,24 @@ async def on_shutdown() -> None:
 
 async def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN is not set")
+        raise ValueError("TELEGRAM_BOT_TOKEN not set")
     if not TELEGRAM_CHAT_ID:
-        raise ValueError("TELEGRAM_CHAT_ID is not set")
+        raise ValueError("TELEGRAM_CHAT_ID not set")
 
     now = datetime.now(timezone.utc)
     scheduler = AsyncIOScheduler(timezone="UTC")
 
-    # Stagger jobs by 3 min each so APIs aren't hammered simultaneously
-    scheduler.add_job(pre_earnings_job, "interval", minutes=CHECK_INTERVAL_MINUTES,
-                      start_date=now)
-    scheduler.add_job(earnings_job,     "interval", minutes=CHECK_INTERVAL_MINUTES,
-                      start_date=now + timedelta(minutes=3))
-
-    # News runs every 1 minute — Upstash dedup ensures no article is ever sent twice
-    scheduler.add_job(news_job, "interval", minutes=1, id="news",
-                      start_date=now + timedelta(seconds=10))
-
-    # Intraday reminders run every 5 minutes — tight loop for 1min/5min alerts
-    scheduler.add_job(intraday_job, "interval", minutes=5, id="intraday",
+    scheduler.add_job(news_job,         "interval", minutes=1,
+                      start_date=now + timedelta(seconds=15))
+    scheduler.add_job(intraday_job,     "interval", minutes=5,
                       start_date=now + timedelta(minutes=1))
-
-    # Daily at 07:00 UTC — refresh and re-pin the upcoming earnings calendar
-    scheduler.add_job(pin_calendar_job, "cron", hour=7, minute=0, id="pin_calendar")
+    scheduler.add_job(pre_earnings_job, "interval", minutes=CHECK_INTERVAL_MINUTES,
+                      start_date=now + timedelta(minutes=2))
+    scheduler.add_job(earnings_job,     "interval", minutes=CHECK_INTERVAL_MINUTES,
+                      start_date=now + timedelta(minutes=5))
 
     scheduler.start()
-    logger.info(f"Scheduler started — every {CHECK_INTERVAL_MINUTES} min")
+    logger.info("Scheduler started")
 
     await on_startup()
 
