@@ -11,11 +11,15 @@ so you can judge direction at a glance.
 
 import hashlib
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import feedparser
 import finnhub
+
+# Finnhub free tier: 30 calls/minute → 1 call per 2 seconds to stay safe
+_FINNHUB_DELAY = 2.0
 
 from config import FINNHUB_API_KEY, NEWS_LOOKBACK_HOURS, MAX_NEWS_PER_TICKER
 from storage import is_seen, mark_seen
@@ -58,6 +62,7 @@ def _sentiment(text: str) -> str:
 
 
 def _finnhub_news(ticker: str, from_ts: int, to_ts: int) -> list[NewsItem]:
+    time.sleep(_FINNHUB_DELAY)
     items = []
     try:
         articles = _fh.company_news(
