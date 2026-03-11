@@ -15,8 +15,7 @@ from datetime import timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from earnings import EarningsReport, IntradayReminder, UpcomingEarnings
-from news import NewsItem
+from models import EarningsReport, IntradayReminder, NewsItem, UpcomingEarnings
 from tickers import TICKER_TO_MEXC
 
 ET = ZoneInfo("America/New_York")
