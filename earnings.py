@@ -153,23 +153,35 @@ async def _fh_surprises(ticker: str) -> list[dict]:
         return []
 
 
+async def _yf_fetch(ticker: str, fetch_fn) -> any:
+    """
+    Single choke point for ALL yfinance calls.
+    2s sleep before every network call (Yahoo allows ~1 req/2s).
+    Returns None on 429 or any error — callers fall back to cache/default.
+    """
+    await asyncio.sleep(2.0)
+    try:
+        return await asyncio.to_thread(fetch_fn)
+    except Exception as e:
+        if "429" in str(e):
+            logger.warning(f"yfinance 429 [{ticker}] — will use cached/default value")
+        else:
+            logger.warning(f"yfinance [{ticker}]: {e}")
+        return None
+
+
 async def _yf_currency(ticker: str) -> str:
     cache_key = f"currency:{ticker}"
     cached = get_cache(cache_key)
     if cached:
         return cached
-
-    def _call():
-        try:
-            info = yf.Ticker(ticker).info
-            return info.get("financialCurrency") or info.get("currency") or "USD"
-        except Exception:
-            return "USD"
-
-    result = await asyncio.to_thread(_call)
-    # Currency almost never changes — cache for 24 hours
-    set_cache(cache_key, result, ttl_seconds=86400)
-    return result
+    result = await _yf_fetch(ticker, lambda: (
+        yf.Ticker(ticker).info.get("financialCurrency") or
+        yf.Ticker(ticker).info.get("currency") or "USD"
+    ))
+    currency = result if isinstance(result, str) else "USD"
+    set_cache(cache_key, currency, ttl_seconds=86400)   # 24h
+    return currency
 
 
 async def _yf_financials(ticker: str) -> dict:
@@ -182,71 +194,63 @@ async def _yf_financials(ticker: str) -> dict:
             pass
 
     def _call():
-        try:
-            stock = yf.Ticker(ticker)
-            qs = stock.quarterly_income_stmt
-            if qs is None or qs.empty:
-                return {}
-            latest = qs.iloc[:, 0]
-            def safe(kw):
-                for label in latest.index:
-                    if kw in label.lower():
-                        val = latest[label]
-                        if val is not None and val == val:
-                            return float(val)
-                return None
-            info = yf.Ticker(ticker).info
-            currency = info.get("financialCurrency") or info.get("currency") or "USD"
-            return {
-                "revenue":      safe("total revenue"),
-                "net_income":   safe("net income"),
-                "gross_profit": safe("gross profit"),
-                "currency":     currency,
-            }
-        except Exception as e:
-            logger.warning(f"yfinance financials [{ticker}]: {e}")
+        stock = yf.Ticker(ticker)
+        qs = stock.quarterly_income_stmt
+        if qs is None or qs.empty:
             return {}
+        latest = qs.iloc[:, 0]
+        def safe(kw):
+            for label in latest.index:
+                if kw in label.lower():
+                    val = latest[label]
+                    if val is not None and val == val:
+                        return float(val)
+            return None
+        info = yf.Ticker(ticker).info
+        return {
+            "revenue":      safe("total revenue"),
+            "net_income":   safe("net income"),
+            "gross_profit": safe("gross profit"),
+            "currency":     info.get("financialCurrency") or info.get("currency") or "USD",
+        }
 
-    result = await asyncio.to_thread(_call)
+    result = await _yf_fetch(ticker, _call)
     if result:
-        # Financials change quarterly — cache for 12 hours
-        set_cache(cache_key, json.dumps(result), ttl_seconds=43200)
-    return result
+        set_cache(cache_key, json.dumps(result), ttl_seconds=43200)  # 12h
+    return result or {}
 
 
 async def _yf_earnings_dates(ticker: str) -> list[str]:
-    """
-    Fetch upcoming earnings dates from yfinance earnings_dates DataFrame.
-    Returns a list of date strings "YYYY-MM-DD", newest-first.
-    This hits Yahoo Finance directly — a completely separate data provider
-    from Finnhub, so the two can be cross-checked against each other.
-    """
-    def _call():
-        dates = []
+    cache_key = f"yf_dates:{ticker}"
+    cached = get_cache(cache_key)
+    if cached:
         try:
-            ed = yf.Ticker(ticker).earnings_dates
-            if ed is None or ed.empty:
-                return dates
-            today = datetime.now(timezone.utc).date()
-            for idx in ed.index:
-                try:
-                    d = idx.astimezone(ET).date()
-                except Exception:
-                    d = idx.date()
-                if d >= today:
-                    dates.append(str(d))
+            return json.loads(cached)
         except Exception:
             pass
+
+    def _call():
+        dates = []
+        ed = yf.Ticker(ticker).earnings_dates
+        if ed is None or ed.empty:
+            return dates
+        today = datetime.now(timezone.utc).date()
+        for idx in ed.index:
+            try:
+                d = idx.astimezone(ET).date()
+            except Exception:
+                d = idx.date()
+            if d >= today:
+                dates.append(str(d))
         return dates
-    return await asyncio.to_thread(_call)
+
+    result = await _yf_fetch(ticker, _call)
+    dates = result if isinstance(result, list) else []
+    set_cache(cache_key, json.dumps(dates), ttl_seconds=14400)  # 4h
+    return dates
 
 
 async def _yf_exact_time_for_date(ticker: str, date_str: str) -> Optional[datetime]:
-    """
-    Return the exact tz-aware UTC time from yfinance for a specific date.
-    Returns None if yfinance has no time data for that date.
-    Cached in Upstash for 4 hours to avoid hammering Yahoo.
-    """
     cache_key = f"exact_time:{ticker}:{date_str}"
     cached = get_cache(cache_key)
     if cached:
@@ -255,26 +259,21 @@ async def _yf_exact_time_for_date(ticker: str, date_str: str) -> Optional[dateti
         except Exception:
             pass
 
-    await asyncio.sleep(0.5)  # gentle throttle between yfinance calls
-
     def _call():
-        try:
-            ed = yf.Ticker(ticker).earnings_dates
-            if ed is None or ed.empty:
-                return None
-            for idx in ed.index:
-                try:
-                    idx_et = idx.astimezone(ET)
-                except Exception:
-                    idx_et = idx
-                if str(idx_et.date()) == date_str:
-                    return idx.astimezone(timezone.utc)
-        except Exception:
-            pass
+        ed = yf.Ticker(ticker).earnings_dates
+        if ed is None or ed.empty:
+            return None
+        for idx in ed.index:
+            try:
+                idx_et = idx.astimezone(ET)
+            except Exception:
+                idx_et = idx
+            if str(idx_et.date()) == date_str:
+                return idx.astimezone(timezone.utc)
         return None
 
-    result = await asyncio.to_thread(_call)
-    set_cache(cache_key, result.isoformat() if result else "null", ttl_seconds=14400)
+    result = await _yf_fetch(ticker, _call)
+    set_cache(cache_key, result.isoformat() if result else "null", ttl_seconds=14400)  # 4h
     return result
 
 
