@@ -141,12 +141,12 @@ async def news_job() -> None:
     logger.info("Running news check...")
     try:
         items = check_new_news()
-        if items:
-            for batch in pack_messages([format_news(i) for i in items]):
-                await bot.send_message(
-                    TELEGRAM_CHAT_ID,
-                    f"📡 <b>{len(items)} new article(s)</b>\n\n" + batch
-                )
+        for item in items:
+            try:
+                await bot.send_message(TELEGRAM_CHAT_ID, format_news(item))
+                await asyncio.sleep(0.5)  # small gap so Telegram doesn't rate-limit us
+            except Exception as e:
+                logger.warning(f"Failed to send news item [{item.ticker}]: {e}")
         _last["news"] = datetime.now(timezone.utc)
     except Exception as e:
         logger.error(f"news_job: {e}", exc_info=True)
@@ -329,8 +329,10 @@ async def main() -> None:
                       start_date=now)
     scheduler.add_job(earnings_job,     "interval", minutes=CHECK_INTERVAL_MINUTES,
                       start_date=now + timedelta(minutes=3))
-    scheduler.add_job(news_job,         "interval", minutes=CHECK_INTERVAL_MINUTES,
-                      start_date=now + timedelta(minutes=6))
+
+    # News runs every 1 minute — Upstash dedup ensures no article is ever sent twice
+    scheduler.add_job(news_job, "interval", minutes=1, id="news",
+                      start_date=now + timedelta(seconds=10))
 
     # Intraday reminders run every 5 minutes — tight loop for 1min/5min alerts
     scheduler.add_job(intraday_job, "interval", minutes=5, id="intraday",
