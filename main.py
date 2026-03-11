@@ -29,7 +29,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, CHECK_INTERVAL_MINUTES
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_THREAD_ID, CHECK_INTERVAL_MINUTES
 from earnings import (
     check_upcoming_earnings_alerts,
     check_new_earnings,
@@ -50,6 +50,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+# yfinance logs "No earnings dates found" / "may be delisted" as ERROR for
+# perfectly valid tickers when Yahoo simply has no data — pure noise.
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -57,6 +60,30 @@ dp  = Dispatcher()
 
 _last: dict = {"pre": None, "earnings": None, "news": None}
 CATEGORIES = ("pre", "earnings", "news")
+
+
+# ─── Send helper ──────────────────────────────────────────────────────────────
+
+async def _send(text: str, pin: bool = False) -> int | None:
+    """
+    Send a message to the configured chat and optional thread.
+    Returns the message_id so callers can pin it.
+    Pin=True pins the message silently (no notification to members).
+    """
+    kwargs = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    if TELEGRAM_THREAD_ID:
+        kwargs["message_thread_id"] = TELEGRAM_THREAD_ID
+    msg = await bot.send_message(**kwargs)
+    if pin and msg:
+        try:
+            await bot.pin_chat_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                message_id=msg.message_id,
+                disable_notification=True,
+            )
+        except Exception as e:
+            logger.warning(f"Pin failed: {e}")
+    return msg.message_id if msg else None
 
 
 # ─── Mute helpers ─────────────────────────────────────────────────────────────
@@ -71,14 +98,16 @@ def _set_mute(cat: str, on: bool) -> None:
 # ─── Scheduler jobs ───────────────────────────────────────────────────────────
 
 async def news_job() -> None:
-    """Every 1 min. Fully async — never blocks commands."""
+    """Every 5 min. Drops neutral news — only positive/negative gets sent."""
     if _muted("news"):
         return
     try:
         items = await check_new_news()
-        for item in items:
+        # Only send news that will actually move the price
+        actionable = [i for i in items if i.sentiment != "neutral"]
+        for item in actionable:
             try:
-                await bot.send_message(TELEGRAM_CHAT_ID, format_news(item))
+                await _send(format_news(item))
                 await asyncio.sleep(0.4)
             except Exception as e:
                 logger.warning(f"Send news [{item.ticker}]: {e}")
@@ -95,7 +124,7 @@ async def intraday_job() -> None:
         reminders = await check_intraday_reminders()
         for r in reminders:
             try:
-                await bot.send_message(TELEGRAM_CHAT_ID, format_intraday_reminder(r))
+                await _send(format_intraday_reminder(r))
                 await asyncio.sleep(0.4)
             except Exception as e:
                 logger.warning(f"Send intraday [{r.ticker}]: {e}")
@@ -104,7 +133,7 @@ async def intraday_job() -> None:
 
 
 async def pre_earnings_job() -> None:
-    """Every 30 min. Fires day-level milestone alerts + refreshes /upcoming cache."""
+    """Every 4h. Fires day-level milestone alerts + refreshes pinned calendar."""
     if _muted("pre"):
         return
     try:
@@ -112,34 +141,59 @@ async def pre_earnings_job() -> None:
         alerts.sort(key=lambda a: a.milestone)
         for a in alerts:
             try:
-                await bot.send_message(TELEGRAM_CHAT_ID, format_pre_earnings(a))
+                await _send(format_pre_earnings(a))
                 await asyncio.sleep(0.4)
             except Exception as e:
                 logger.warning(f"Send pre-earnings [{a.ticker}]: {e}")
         _last["pre"] = datetime.now(timezone.utc)
 
-        # Refresh the calendar cache so /upcoming responds instantly
-        await _fetch_calendar_live(days_ahead=14)
-        logger.info("Calendar cache refreshed")
+        # Refresh calendar cache and re-pin
+        data = await _fetch_calendar_live(days_ahead=14)
+        if data:
+            await _pin_calendar(data)
     except Exception as e:
         logger.error(f"pre_earnings_job: {e}", exc_info=True)
 
 
 async def earnings_job() -> None:
-    """Every 30 min. Sends post-announcement results."""
+    """Every 4h. Sends post-announcement results."""
     if _muted("earnings"):
         return
     try:
         reports = await check_new_earnings()
         for r in reports:
             try:
-                await bot.send_message(TELEGRAM_CHAT_ID, format_earnings(r))
+                await _send(format_earnings(r))
                 await asyncio.sleep(0.4)
             except Exception as e:
                 logger.warning(f"Send earnings [{r.ticker}]: {e}")
         _last["earnings"] = datetime.now(timezone.utc)
     except Exception as e:
         logger.error(f"earnings_job: {e}", exc_info=True)
+
+
+async def _pin_calendar(data: list[dict]) -> None:
+    """Send the upcoming calendar and pin it. Unpins the previous one."""
+    try:
+        text = format_upcoming_calendar(data)
+
+        # Unpin previous calendar message if we stored its ID
+        old_id = get_setting("pinned_calendar_msg_id")
+        if old_id:
+            try:
+                await bot.unpin_chat_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    message_id=int(old_id),
+                )
+            except Exception:
+                pass  # Already deleted or unpinned — fine
+
+        new_id = await _send(text, pin=True)
+        if new_id:
+            set_setting("pinned_calendar_msg_id", str(new_id))
+            logger.info(f"Pinned calendar message {new_id}")
+    except Exception as e:
+        logger.error(f"_pin_calendar: {e}", exc_info=True)
 
 
 # ─── Commands ─────────────────────────────────────────────────────────────────
@@ -174,11 +228,10 @@ async def cmd_help(message: Message) -> None:
 @dp.message(Command("upcoming"))
 async def cmd_upcoming(message: Message) -> None:
     from storage import get_cache
-    # Only show "Fetching..." on a cold cache (first boot before any background job)
     if not get_cache("earnings_calendar_14d"):
         await message.answer("🔍 Fetching… (first load, will be instant next time)")
     data = await get_full_earnings_calendar(days_ahead=14)
-    await message.answer(format_upcoming_calendar(data))
+    await _pin_calendar(data)
 
 
 @dp.message(Command("price"))
@@ -262,8 +315,7 @@ async def on_startup() -> None:
     await pre_earnings_job()
     await earnings_job()
     await news_job()
-    await bot.send_message(
-        TELEGRAM_CHAT_ID,
+    await _send(
         "🚀 <b>MEXC Bot online!</b>\n"
         f"Railway ✅  Upstash {'✅' if redis_ok else '❌'}\n"
         f"{len(ALL_TICKERS)} tickers  |  news=5min  earnings=4h\n"
@@ -273,7 +325,7 @@ async def on_startup() -> None:
 
 async def on_shutdown() -> None:
     try:
-        await bot.send_message(TELEGRAM_CHAT_ID, "🛑 Bot shutting down.")
+        await _send("🛑 Bot shutting down.")
     except Exception:
         pass
 
