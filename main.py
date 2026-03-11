@@ -312,9 +312,6 @@ async def cmd_status(message: Message) -> None:
 async def on_startup() -> None:
     redis_ok = health_check()
     logger.info(f"Startup | Redis: {'ok' if redis_ok else 'FAILED'}")
-    await pre_earnings_job()
-    await earnings_job()
-    await news_job()
     await _send(
         "🚀 <b>MEXC Bot online!</b>\n"
         f"Railway ✅  Upstash {'✅' if redis_ok else '❌'}\n"
