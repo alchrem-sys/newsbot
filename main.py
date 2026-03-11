@@ -35,6 +35,7 @@ from earnings import (
     check_new_earnings,
     check_intraday_reminders,
     get_full_earnings_calendar,
+    _fetch_calendar_live,
 )
 from formatters import (
     format_pre_earnings, format_earnings, format_intraday_reminder,
@@ -103,7 +104,7 @@ async def intraday_job() -> None:
 
 
 async def pre_earnings_job() -> None:
-    """Every 30 min. Fires day-level milestone alerts."""
+    """Every 30 min. Fires day-level milestone alerts + refreshes /upcoming cache."""
     if _muted("pre"):
         return
     try:
@@ -116,6 +117,10 @@ async def pre_earnings_job() -> None:
             except Exception as e:
                 logger.warning(f"Send pre-earnings [{a.ticker}]: {e}")
         _last["pre"] = datetime.now(timezone.utc)
+
+        # Refresh the calendar cache so /upcoming responds instantly
+        await _fetch_calendar_live(days_ahead=14)
+        logger.info("Calendar cache refreshed")
     except Exception as e:
         logger.error(f"pre_earnings_job: {e}", exc_info=True)
 
@@ -168,7 +173,10 @@ async def cmd_help(message: Message) -> None:
 
 @dp.message(Command("upcoming"))
 async def cmd_upcoming(message: Message) -> None:
-    await message.answer("🔍 Fetching…")
+    from storage import get_cache
+    # Only show "Fetching..." on a cold cache (first boot before any background job)
+    if not get_cache("earnings_calendar_14d"):
+        await message.answer("🔍 Fetching… (first load, will be instant next time)")
     data = await get_full_earnings_calendar(days_ahead=14)
     await message.answer(format_upcoming_calendar(data))
 
@@ -258,7 +266,7 @@ async def on_startup() -> None:
         TELEGRAM_CHAT_ID,
         "🚀 <b>MEXC Bot online!</b>\n"
         f"Railway ✅  Upstash {'✅' if redis_ok else '❌'}\n"
-        f"{len(ALL_TICKERS)} tickers  |  news=1min  earnings={CHECK_INTERVAL_MINUTES}min\n"
+        f"{len(ALL_TICKERS)} tickers  |  news=5min  earnings=4h\n"
         "/help for commands"
     )
 
@@ -281,14 +289,14 @@ async def main() -> None:
     now = datetime.now(timezone.utc)
     scheduler = AsyncIOScheduler(timezone="UTC")
 
-    scheduler.add_job(news_job,         "interval", minutes=1,
+    scheduler.add_job(news_job,         "interval", minutes=5,
                       start_date=now + timedelta(seconds=15))
     scheduler.add_job(intraday_job,     "interval", minutes=5,
                       start_date=now + timedelta(minutes=1))
-    scheduler.add_job(pre_earnings_job, "interval", minutes=CHECK_INTERVAL_MINUTES,
+    scheduler.add_job(pre_earnings_job, "interval", hours=4,
                       start_date=now + timedelta(minutes=2))
-    scheduler.add_job(earnings_job,     "interval", minutes=CHECK_INTERVAL_MINUTES,
-                      start_date=now + timedelta(minutes=5))
+    scheduler.add_job(earnings_job,     "interval", hours=4,
+                      start_date=now + timedelta(minutes=3))
 
     scheduler.start()
     logger.info("Scheduler started")
