@@ -128,8 +128,29 @@ def _score(headline: str, summary: str) -> tuple[int, str, str]:
 # ── Async fetchers ────────────────────────────────────────────────────────────
 
 async def _fetch_finnhub(ticker: str, from_ts: int, to_ts: int) -> list[NewsItem]:
-    """Runs Finnhub call in a thread — never blocks the event loop."""
-    await asyncio.sleep(_FINNHUB_DELAY)  # async sleep — yields to event loop
+    """
+    Fetch Finnhub news for a ticker. Cached for 5 minutes (matching the job interval)
+    so rapid re-runs never hit the API twice for the same window.
+    """
+    import json
+    from storage import get_cache, set_cache
+
+    cache_key = f"fh_news:{ticker}:{from_ts // 300}"  # bucket by 5-min window
+    cached = get_cache(cache_key)
+    if cached:
+        try:
+            raw = json.loads(cached)
+            items = []
+            for r in raw:
+                item = NewsItem(ticker=r["ticker"], headline=r["headline"],
+                                summary=r["summary"], url=r["url"],
+                                source=r["source"], published_at=r["published_at"])
+                items.append(item)
+            return items
+        except Exception:
+            pass
+
+    await asyncio.sleep(_FINNHUB_DELAY)
 
     def _sync_call():
         return _fh.company_news(
@@ -151,8 +172,17 @@ async def _fetch_finnhub(ticker: str, from_ts: int, to_ts: int) -> list[NewsItem
                 source=art.get("source", "Finnhub"),
                 published_at=pub.strftime("%Y-%m-%d %H:%M UTC"),
             ))
+        # Cache even empty results to prevent hammering on quiet tickers
+        serialized = json.dumps([{
+            "ticker": i.ticker, "headline": i.headline, "summary": i.summary,
+            "url": i.url, "source": i.source, "published_at": i.published_at,
+        } for i in items])
+        set_cache(cache_key, serialized, ttl_seconds=300)  # 5 min
     except Exception as e:
-        logger.warning(f"Finnhub news [{ticker}]: {e}")
+        if "429" in str(e):
+            logger.warning(f"Finnhub 429 news [{ticker}] — skipping")
+        else:
+            logger.warning(f"Finnhub news [{ticker}]: {e}")
     return items
 
 
