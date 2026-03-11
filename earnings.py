@@ -20,7 +20,7 @@ _FINNHUB_DELAY = 2.0
 ET = ZoneInfo("America/New_York")
 
 from config import FINNHUB_API_KEY, EARNINGS_LOOKBACK_DAYS, PRE_EARNINGS_ALERT_DAYS
-from storage import is_seen, mark_seen
+from storage import is_seen, mark_seen, set_cache, get_cache
 from tickers import EQUITY_TICKERS, TICKER_TO_MEXC
 
 logger = logging.getLogger(__name__)
@@ -441,7 +441,49 @@ async def check_new_earnings() -> list[EarningsReport]:
 
 # ─── Full calendar (/upcoming command) ───────────────────────────────────────
 
+CALENDAR_CACHE_KEY = "earnings_calendar_14d"
+CALENDAR_CACHE_TTL = 60 * 35  # 35 min — slightly longer than the 30-min job interval
+
+
 async def get_full_earnings_calendar(days_ahead: int = 14) -> list[dict]:
+    """
+    Returns the earnings calendar for the next N days.
+
+    Reads from Upstash cache first — response is instant (<100ms).
+    Cache is written by pre_earnings_job() every 30 min so data is always fresh.
+    Falls back to a live fetch only if the cache is empty (e.g. first boot).
+    """
+    import json
+
+    # ── Try cache first ───────────────────────────────────────────────────────
+    cached = get_cache(CALENDAR_CACHE_KEY)
+    if cached:
+        try:
+            data = json.loads(cached)
+            # Recompute days_until from today since cache may be a few minutes old
+            today = datetime.now(timezone.utc).date()
+            for item in data:
+                d = _parse_date(item["date"])
+                item["days_until"] = (d - today).days if d else 0
+                # exact_time was stored as ISO string — restore to datetime
+                if item.get("exact_time_iso"):
+                    try:
+                        item["exact_time"] = datetime.fromisoformat(item["exact_time_iso"])
+                    except Exception:
+                        item["exact_time"] = None
+            return [i for i in data if 0 <= i["days_until"] <= days_ahead]
+        except Exception as e:
+            logger.warning(f"Cache parse error: {e} — falling back to live fetch")
+
+    # ── Cache miss: live fetch (only happens on first boot) ───────────────────
+    logger.info("Calendar cache miss — doing live fetch")
+    return await _fetch_calendar_live(days_ahead)
+
+
+async def _fetch_calendar_live(days_ahead: int = 14) -> list[dict]:
+    """Live fetch from Finnhub. Called by the background job and on cache miss."""
+    import json
+
     today = datetime.now(timezone.utc).date()
     results = []
     for ticker in EQUITY_TICKERS:
@@ -452,6 +494,7 @@ async def get_full_earnings_calendar(days_ahead: int = 14) -> list[dict]:
                 continue
             days_until = (d - today).days
             if 0 <= days_until <= days_ahead:
+                exact_time = _derive_time(raw_date, entry.get("hour", ""))
                 results.append({
                     "ticker":           ticker,
                     "date":             raw_date,
@@ -459,7 +502,17 @@ async def get_full_earnings_calendar(days_ahead: int = 14) -> list[dict]:
                     "eps_estimate":     entry.get("epsEstimate"),
                     "revenue_estimate": entry.get("revenueEstimate"),
                     "report_time":      entry.get("hour", ""),
-                    "exact_time":       _derive_time(raw_date, entry.get("hour", "")),
+                    "exact_time":       exact_time,
+                    "exact_time_iso":   exact_time.isoformat() if exact_time else None,
                     "mexc_symbols":     TICKER_TO_MEXC.get(ticker, []),
                 })
-    return sorted(results, key=lambda x: x["date"])
+
+    results = sorted(results, key=lambda x: x["date"])
+
+    # Write to cache — background job and first-boot both store here
+    try:
+        set_cache(CALENDAR_CACHE_KEY, json.dumps(results, default=str), ttl_seconds=CALENDAR_CACHE_TTL)
+    except Exception as e:
+        logger.warning(f"Failed to write calendar cache: {e}")
+
+    return results
