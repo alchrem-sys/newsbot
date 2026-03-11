@@ -190,8 +190,10 @@ def format_earnings(r: EarningsReport) -> str:
 
 def format_news(item: NewsItem) -> str:
     emoji = _sentiment_emoji(item.sentiment)
+    score_bar = "█" * (item.importance // 20) + "░" * (5 - item.importance // 20)
     lines = [
         f"{emoji} <b>{item.ticker}</b>  {_mexc(item.ticker)}  [{item.sentiment.upper()}]",
+        f"<b>{item.category}</b>  |  Importance: {score_bar} {item.importance}/100",
         "",
         f"<b>{item.headline}</b>",
         "",
