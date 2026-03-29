@@ -748,12 +748,17 @@ async def _send(text: str, pin: bool = False) -> Optional[int]:
 
 async def _pin_calendar_if_changed(data: list[dict]) -> None:
     """
-    Only sends + pins a new calendar message when the content has actually changed.
-    Compares a hash of the calendar text against the last pinned hash stored in Redis.
-    No-op if nothing changed — no unnecessary pins.
+    Only pins when actual earnings data changed (new ticker, date shift, time change).
+    Ignores days_until — that changes every day and would cause re-pin spam.
     """
-    text = fmt_calendar(data)
-    new_hash = hashlib.md5(text.encode()).hexdigest()
+    stable = json.dumps(
+        [{"ticker": i["ticker"], "date": i["date"],
+          "report_time": i.get("report_time", ""),
+          "exact_time_iso": i.get("exact_time_iso")}
+         for i in data],
+        sort_keys=True
+    )
+    new_hash = hashlib.md5(stable.encode()).hexdigest()
     old_hash = await get_setting("pinned_calendar_hash")
 
     if new_hash == old_hash:
